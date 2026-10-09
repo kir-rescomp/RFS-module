@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -u
+
+VERSION="1.0"
+
+RFS_SERVER="${RFS_SERVER:-connect.ox.ac.uk}"
+RFS_SHARE="${RFS_SHARE:-RFS}"
+RFS_DOMAIN="${RFS_DOMAIN:-ox.ac.uk}"
+RFS_CREDENTIALS="${RFS_CREDENTIALS:-$HOME/.rfs_credentials}"
+RFS_USERNAME="${RFS_USERNAME:-${USER:-}}"
+
+CRED_FILE=""
+FORCE_PROMPT=0
+USER_OVERRIDE=""
+
+usage() {
+    cat <<'HELP'
+RFS - convenient command-line access to Oxford RFS via smbclient
+
+Usage:
+  rfs [global options] ls [REMOTE_DIR]
+  rfs [global options] mkdir REMOTE_DIR
+  rfs [global options] put [-r] LOCAL [REMOTE_DIR]
+  rfs [global options] get [-r] REMOTE [LOCAL_DIR]
+
+Aliases:
+  list  -> ls
+  push  -> put
+  fetch -> get
+
+Global options:
+  -c, --credentials FILE   Use FILE as the smbclient credentials file
+  -p, --prompt             Ignore stored credentials and prompt for a password
+  -u, --user USER          RFS/CONNECT username for prompted authentication
+  -h, --help               Show this help
+  -V, --version            Show version
+
+Directory handling:
+  put automatically detects a local directory and enables recursive transfer.
+  -r/--recursive may also be supplied explicitly.
+  get needs -r/--recursive when REMOTE is a directory.
+
+Examples:
+  rfs ls
+  rfs ls MYPROJECT/data
+  rfs mkdir MYPROJECT/results
+
+  rfs put results.csv MYPROJECT/results
+  rfs put results_dir MYPROJECT
+  rfs put -r results_dir MYPROJECT
+
+  rfs get MYPROJECT/results.csv
+  rfs get MYPROJECT/results.csv /scratch/$USER
+  rfs get -r MYPROJECT/results /scratch/$USER
+
+Authentication:
+  If ~/.rfs_credentials exists, it is used automatically.
+  Otherwise RFS prompts for the password securely.
+
+  Credentials-file format:
+      username = YOUR_USERNAME
+      password = YOUR_PASSWORD
+      domain   = ox.ac.uk
+
+  Protect it with:
+      chmod 600 ~/.rfs_credentials
+
+Environment variables normally set by the RFS module:
+  RFS_SERVER, RFS_SHARE, RFS_DOMAIN, RFS_CREDENTIALS
+HELP
+}
+
+die() {
+    printf 'rfs: %s\n' "$*" >&2
+    exit 2
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command '$1' was not found"
+}
+
+validate_smb_arg() {
+    local s="$1"
+    [[ "$s" != *$'\n'* && "$s" != *$'\r'* && "$s" != *'"'* ]] || \
+        die 'paths containing newlines or double quotes are not supported'
+}
+
+strip_remote_slashes() {
+    local s="$1"
+    while [[ "$s" == /* ]]; do s="${s#/}"; done
+    while [[ "$s" == */ && -n "$s" ]]; do s="${s%/}"; done
+    printf '%s' "$s"
+}
+
+emit_cd_remote() {
+    local path
+    path="$(strip_remote_slashes "$1")"
+    if [[ -n "$path" ]]; then
+        validate_smb_arg "$path"
+        printf 'cd "%s"\n' "$path"
+    fi
+}
+
+check_credentials_file() {
+    local f="$1" owner perm
+    [[ -f "$f" ]] || die "credentials file not found: $f"
+    owner="$(stat -c '%u' -- "$f")" || die "cannot stat credentials file: $f"
+    [[ "$owner" == "$(id -u)" ]] || die "credentials file must be owned by you: $f"
+    perm="$(stat -c '%a' -- "$f")" || die "cannot read permissions for: $f"
+    if (( (8#$perm & 077) != 0 )); then
+        die "credentials file is too permissive ($perm); run: chmod 600 '$f'"
+    fi
+}
+
+run_smb() {
+    local cmdfile="$1"
+    local service="//$RFS_SERVER/$RFS_SHARE"
+    local status password username
+    local -a args
+
+    args=(smbclient "$service")
+
+    if [[ -n "$CRED_FILE" ]]; then
+        check_credentials_file "$CRED_FILE"
+        args+=(-A "$CRED_FILE")
+        "${args[@]}" < "$cmdfile"
+        return $?
+    fi
+
+    if (( ! FORCE_PROMPT )) && [[ -f "$RFS_CREDENTIALS" ]]; then
+        check_credentials_file "$RFS_CREDENTIALS"
+        args+=(-A "$RFS_CREDENTIALS")
+        "${args[@]}" < "$cmdfile"
+        return $?
+    fi
+
+    username="${USER_OVERRIDE:-$RFS_USERNAME}"
+    [[ -n "$username" ]] || die 'no username available; use --user USER'
+
+    if [[ ! -r /dev/tty ]]; then
+        die 'interactive authentication requires a terminal; use --credentials for batch jobs'
+    fi
+
+    printf 'RFS password for %s\\%s: ' "$RFS_DOMAIN" "$username" > /dev/tty
+    IFS= read -r -s password < /dev/tty
+    printf '\n' > /dev/tty
+
+    exec 3<<<"$password"
+    PASSWD_FD=3 "${args[@]}" -W "$RFS_DOMAIN" -U "$username" < "$cmdfile"
+    status=$?
+    exec 3<&-
+    unset password
+    return "$status"
+}
+
+make_cmdfile() {
+    mktemp "${TMPDIR:-/tmp}/rfs.XXXXXXXX"
+}
+
+run_ls() {
+    local remote="${1:-}" cmdfile
+    validate_smb_arg "$remote"
+    cmdfile="$(make_cmdfile)" || die 'could not create temporary command file'
+    {
+        emit_cd_remote "$remote"
+        printf 'ls\nquit\n'
+    } > "$cmdfile"
+    run_smb "$cmdfile"
+    local status=$?
+    rm -f -- "$cmdfile"
+    return "$status"
+}
+
+run_mkdir() {
+    local remote="$1" cmdfile
+    remote="$(strip_remote_slashes "$remote")"
+    [[ -n "$remote" ]] || die 'mkdir requires a remote directory name'
+    validate_smb_arg "$remote"
+    cmdfile="$(make_cmdfile)" || die 'could not create temporary command file'
+    printf 'mkdir "%s"\nquit\n' "$remote" > "$cmdfile"
+    run_smb "$cmdfile"
+    local status=$?
+    rm -f -- "$cmdfile"
+    return "$status"
+}
+
+run_put() {
+    local recursive=0 src remote="" parent base cmdfile
+
+    while (($#)); do
+        case "$1" in
+            -r|--recursive) recursive=1; shift ;;
+            --) shift; break ;;
+            -*) die "unknown put option: $1" ;;
+            *) break ;;
+        esac
+    done
+
+    (($# >= 1 && $# <= 2)) || die 'usage: rfs put [-r] LOCAL [REMOTE_DIR]'
+    src="$1"
+    remote="${2:-}"
+
+    [[ -e "$src" ]] || die "local path does not exist: $src"
+    validate_smb_arg "$src"
+    validate_smb_arg "$remote"
+
+    if [[ -d "$src" ]]; then
+        recursive=1
+    fi
+
+    parent="$(cd -- "$(dirname -- "$src")" && pwd -P)" || die "cannot access local path: $src"
+    base="$(basename -- "$src")"
+    validate_smb_arg "$parent"
+    validate_smb_arg "$base"
+
+    cmdfile="$(make_cmdfile)" || die 'could not create temporary command file'
+
+    {
+        emit_cd_remote "$remote"
+        printf 'lcd "%s"\n' "$parent"
+        if (( recursive )); then
+            printf 'recurse\nprompt\nmput "%s"\n' "$base"
+        else
+            printf 'put "%s" "%s"\n' "$base" "$base"
+        fi
+        printf 'quit\n'
+    } > "$cmdfile"
+
+    run_smb "$cmdfile"
+    local status=$?
+    rm -f -- "$cmdfile"
+    return "$status"
+}
+
+run_get() {
+    local recursive=0 remote localdir="." parent base cmdfile
+
+    while (($#)); do
+        case "$1" in
+            -r|--recursive) recursive=1; shift ;;
+            --) shift; break ;;
+            -*) die "unknown get option: $1" ;;
+            *) break ;;
+        esac
+    done
+
+    (($# >= 1 && $# <= 2)) || die 'usage: rfs get [-r] REMOTE [LOCAL_DIR]'
+    remote="$(strip_remote_slashes "$1")"
+    localdir="${2:-.}"
+    [[ -n "$remote" ]] || die 'get requires a remote file or directory'
+
+    validate_smb_arg "$remote"
+    validate_smb_arg "$localdir"
+
+    mkdir -p -- "$localdir" || die "cannot create local destination: $localdir"
+    localdir="$(cd -- "$localdir" && pwd -P)" || die "cannot access local destination: $localdir"
+
+    if [[ "$remote" == */* ]]; then
+        parent="${remote%/*}"
+        base="${remote##*/}"
+    else
+        parent=""
+        base="$remote"
+    fi
+    validate_smb_arg "$parent"
+    validate_smb_arg "$base"
+
+    cmdfile="$(make_cmdfile)" || die 'could not create temporary command file'
+
+    {
+        printf 'lcd "%s"\n' "$localdir"
+        emit_cd_remote "$parent"
+        if (( recursive )); then
+            printf 'recurse\nprompt\nmget "%s"\n' "$base"
+        else
+            printf 'get "%s" "%s"\n' "$base" "$base"
+        fi
+        printf 'quit\n'
+    } > "$cmdfile"
+
+    run_smb "$cmdfile"
+    local status=$?
+    rm -f -- "$cmdfile"
+    return "$status"
+}
+
+while (($#)); do
+    case "$1" in
+        -c|--credentials)
+            (($# >= 2)) || die "$1 requires a filename"
+            CRED_FILE="$2"; shift 2 ;;
+        -p|--prompt)
+            FORCE_PROMPT=1; shift ;;
+        -u|--user)
+            (($# >= 2)) || die "$1 requires a username"
+            USER_OVERRIDE="$2"; shift 2 ;;
+        -h|--help)
+            usage; exit 0 ;;
+        -V|--version)
+            printf 'rfs %s\n' "$VERSION"; exit 0 ;;
+        --)
+            shift; break ;;
+        -*) die "unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+
+(($# >= 1)) || { usage; exit 2; }
+
+require_cmd smbclient
+require_cmd stat
+
+command_name="$1"
+shift
+
+case "$command_name" in
+    ls|list)
+        (($# <= 1)) || die 'usage: rfs ls [REMOTE_DIR]'
+        run_ls "${1:-}" ;;
+    mkdir|md)
+        (($# == 1)) || die 'usage: rfs mkdir REMOTE_DIR'
+        run_mkdir "$1" ;;
+    put|push)
+        run_put "$@" ;;
+    get|fetch)
+        run_get "$@" ;;
+    help)
+        usage ;;
+    *)
+        die "unknown command '$command_name' (try: rfs --help)" ;;
+esac
