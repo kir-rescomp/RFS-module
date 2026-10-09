@@ -56,8 +56,8 @@ Examples:
   rfs put -r results_dir MYPROJECT
 
   rfs get MYPROJECT/results.csv
-  rfs get MYPROJECT/results.csv /scratch/$USER
-  rfs get -r MYPROJECT/results /scratch/$USER
+  rfs get MYPROJECT/results.csv /well/group/projects/archive
+  rfs get -r MYPROJECT/results /well/group/projects/archive
 
 Authentication:
   rfs auth prompts once and temporarily caches credentials for up to 8 hours.
