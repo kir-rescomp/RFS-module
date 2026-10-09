@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="1.0"
+VERSION="1.1"
 
 RFS_SERVER="${RFS_SERVER:-connect.ox.ac.uk}"
 RFS_SHARE="${RFS_SHARE:-RFS}"
-RFS_DOMAIN="${RFS_DOMAIN:-ox.ac.uk}"
+RFS_DOMAIN="${RFS_DOMAIN:-AD-OAK}"
 RFS_CREDENTIALS="${RFS_CREDENTIALS:-$HOME/.rfs_credentials}"
 RFS_USERNAME="${RFS_USERNAME:-${USER:-}}"
+RFS_AUTH_TTL=28800
 
 CRED_FILE=""
 FORCE_PROMPT=0
@@ -18,6 +19,8 @@ usage() {
 RFS - convenient command-line access to Oxford RFS via smbclient
 
 Usage:
+  rfs [global options] auth
+  rfs [global options] logout
   rfs [global options] ls [REMOTE_DIR]
   rfs [global options] mkdir REMOTE_DIR
   rfs [global options] put [-r] LOCAL [REMOTE_DIR]
@@ -41,6 +44,9 @@ Directory handling:
   get needs -r/--recursive when REMOTE is a directory.
 
 Examples:
+  rfs auth
+  rfs logout
+
   rfs ls
   rfs ls MYPROJECT/data
   rfs mkdir MYPROJECT/results
@@ -54,8 +60,13 @@ Examples:
   rfs get -r MYPROJECT/results /scratch/$USER
 
 Authentication:
-  If ~/.rfs_credentials exists, it is used automatically.
-  Otherwise RFS prompts for the password securely.
+  rfs auth prompts once and temporarily caches credentials for up to 8 hours.
+  rfs logout removes only those temporary cached credentials.
+
+  If no temporary credentials are cached and ~/.rfs_credentials exists,
+  that file is used automatically. Otherwise RFS prompts securely.
+
+  Use --prompt to bypass all automatically selected credentials for one command.
 
   Credentials-file format:
       username = YOUR_USERNAME
@@ -112,6 +123,85 @@ check_credentials_file() {
     fi
 }
 
+rfs_cache_dir() {
+    if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && -w "$XDG_RUNTIME_DIR" ]]; then
+        printf '%s/rfs' "$XDG_RUNTIME_DIR"
+    else
+        printf '%s/rfs-%s' "${TMPDIR:-/tmp}" "$(id -u)"
+    fi
+}
+
+rfs_cache_file() {
+    printf '%s/credentials' "$(rfs_cache_dir)"
+}
+
+cache_is_valid() {
+    local f="$1" mtime now age
+    [[ -f "$f" ]] || return 1
+    check_credentials_file "$f"
+    mtime="$(stat -c '%Y' -- "$f")" || return 1
+    now="$(date +%s)" || return 1
+    age=$((now - mtime))
+    if (( age >= 0 && age < RFS_AUTH_TTL )); then
+        return 0
+    fi
+    rm -f -- "$f"
+    return 1
+}
+
+run_auth() {
+    local username entered password cache_dir cache_file tmp owner
+
+    [[ -r /dev/tty && -w /dev/tty ]] || die 'rfs auth requires an interactive terminal'
+
+    username="${USER_OVERRIDE:-$RFS_USERNAME}"
+    if [[ -n "$username" ]]; then
+        printf 'RFS username [%s]: ' "$username" > /dev/tty
+    else
+        printf 'RFS username: ' > /dev/tty
+    fi
+    IFS= read -r entered < /dev/tty
+    [[ -n "$entered" ]] && username="$entered"
+    [[ -n "$username" ]] || die 'no username supplied'
+
+    printf 'RFS password for %s\\%s: ' "$RFS_DOMAIN" "$username" > /dev/tty
+    IFS= read -r -s password < /dev/tty
+    printf '\n' > /dev/tty
+
+    cache_dir="$(rfs_cache_dir)"
+    cache_file="$cache_dir/credentials"
+
+    if [[ -e "$cache_dir" ]]; then
+        [[ -d "$cache_dir" && ! -L "$cache_dir" ]] || die "unsafe credential cache path: $cache_dir"
+        owner="$(stat -c '%u' -- "$cache_dir")" || die "cannot stat credential cache: $cache_dir"
+        [[ "$owner" == "$(id -u)" ]] || die "credential cache must be owned by you: $cache_dir"
+        chmod 700 -- "$cache_dir" || die "cannot secure credential cache: $cache_dir"
+    else
+        (umask 077; mkdir -p -- "$cache_dir") || die "cannot create credential cache: $cache_dir"
+    fi
+
+    tmp="$(mktemp "$cache_dir/.credentials.XXXXXXXX")" || die 'cannot create temporary credential cache'
+    chmod 600 -- "$tmp" || { rm -f -- "$tmp"; die 'cannot secure temporary credential cache'; }
+    {
+        printf 'username = %s\n' "$username"
+        printf 'password = %s\n' "$password"
+        printf 'domain = %s\n' "$RFS_DOMAIN"
+    } > "$tmp" || { rm -f -- "$tmp"; unset password; die 'cannot write temporary credential cache'; }
+    mv -f -- "$tmp" "$cache_file" || { rm -f -- "$tmp"; unset password; die 'cannot install temporary credential cache'; }
+    unset password
+
+    printf "RFS credentials cached for up to 8 hours. Run 'rfs logout' to clear them.\n"
+}
+
+run_logout() {
+    local cache_dir cache_file
+    cache_dir="$(rfs_cache_dir)"
+    cache_file="$cache_dir/credentials"
+    rm -f -- "$cache_file" || die 'could not remove temporary RFS credentials'
+    rmdir -- "$cache_dir" 2>/dev/null || true
+    printf 'Temporary RFS credentials cleared.\n'
+}
+
 run_smb() {
     local cmdfile="$1"
     local service="//$RFS_SERVER/$RFS_SHARE"
@@ -127,11 +217,21 @@ run_smb() {
         return $?
     fi
 
-    if (( ! FORCE_PROMPT )) && [[ -f "$RFS_CREDENTIALS" ]]; then
-        check_credentials_file "$RFS_CREDENTIALS"
-        args+=(-A "$RFS_CREDENTIALS")
-        "${args[@]}" < "$cmdfile"
-        return $?
+    if (( ! FORCE_PROMPT )); then
+        local cache_file
+        cache_file="$(rfs_cache_file)"
+        if cache_is_valid "$cache_file"; then
+            args+=(-A "$cache_file")
+            "${args[@]}" < "$cmdfile"
+            return $?
+        fi
+
+        if [[ -f "$RFS_CREDENTIALS" ]]; then
+            check_credentials_file "$RFS_CREDENTIALS"
+            args+=(-A "$RFS_CREDENTIALS")
+            "${args[@]}" < "$cmdfile"
+            return $?
+        fi
     fi
 
     username="${USER_OVERRIDE:-$RFS_USERNAME}"
@@ -314,6 +414,12 @@ command_name="$1"
 shift
 
 case "$command_name" in
+    auth)
+        (($# == 0)) || die 'usage: rfs auth'
+        run_auth ;;
+    logout)
+        (($# == 0)) || die 'usage: rfs logout'
+        run_logout ;;
     ls|list)
         (($# <= 1)) || die 'usage: rfs ls [REMOTE_DIR]'
         run_ls "${1:-}" ;;
