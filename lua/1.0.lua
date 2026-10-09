@@ -16,7 +16,7 @@ whatis("Name: RFS")
 whatis("Version: 1.0")
 whatis("Description: Command-line access to Oxford RFS via smbclient")
 
-local root = "/apps/RFS/1.0"
+local root = "/gpfs3/apps/kir/eb/skylake/software/RFS/1.0/bin"
 
 setenv("RFS_SERVER", "connect.ox.ac.uk")
 setenv("RFS_SHARE", "RFS")
