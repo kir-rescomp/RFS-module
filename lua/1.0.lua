@@ -1,7 +1,14 @@
 help([[
+
+Description
+===========
 RFS - convenient command-line access to Oxford Research File Service.
 
 This module provides the 'rfs' command, a small wrapper around smbclient.
+
+More information
+===============
+- Support Documentation: https://kir-rescomp.github.io/kir-researchcomp-hub/data-transfer/rfs/
 
 Common commands:
   rfs ls [REMOTE_DIR]
