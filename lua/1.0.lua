@@ -1,14 +1,9 @@
 help([[
+RFS provides the 'rfs' command, a small wrapper around smbclient for
+command-line access to the Oxford Research File Service.
 
-Description
-===========
-RFS - convenient command-line access to Oxford Research File Service.
-
-This module provides the 'rfs' command, a small wrapper around smbclient.
-
-More information
-===============
-- Support Documentation: https://kir-rescomp.github.io/kir-researchcomp-hub/data-transfer/rfs/
+Documentation:
+  https://kir-rescomp.github.io/kir-researchcomp-hub/data-transfer/rfs/
 
 Common commands:
   rfs ls [REMOTE_DIR]
@@ -22,8 +17,9 @@ Common commands:
 whatis("Name: RFS")
 whatis("Version: 1.0")
 whatis("Description: Command-line access to Oxford RFS via smbclient")
+whatis("URL: https://kir-rescomp.github.io/kir-researchcomp-hub/data-transfer/rfs/")
 
-local root = "/gpfs3/apps/kir/eb/skylake/software/RFS/1.0/bin"
+local root = "/gpfs3/apps/kir/eb/skylake/software/RFS/1.0"
 
 setenv("RFS_SERVER", "connect.ox.ac.uk")
 setenv("RFS_SHARE", "RFS")
